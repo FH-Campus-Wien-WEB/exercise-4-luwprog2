@@ -13,12 +13,14 @@ const app = express();
 app.use(bodyParser.json());
 
 // Session middleware
-app.use(session({
-  secret: config.sessionSecret,
-  resave: false,
-  saveUninitialized: true,
-  cookie: { secure: false } // Set to true if using HTTPS
-}));
+app.use(
+  session({
+    secret: config.sessionSecret,
+    resave: false,
+    saveUninitialized: true,
+    cookie: { secure: false }, // Set to true if using HTTPS
+  }),
+);
 
 // Serve static content in directory 'files'
 app.use(express.static(path.join(__dirname, "files")));
@@ -40,9 +42,34 @@ app.post("/login", function (req, res) {
 });
 
 // Task 1.3: Implement the GET `/logout` endpoint and requireLogin
-// protection. Implement logout by destroying the session 
-// with error handling. Protect all endpoints that need 
+// protection. Implement logout by destroying the session
+// with error handling. Protect all endpoints that need
 // authentication with `requireLogin`.
+// requireLogin middleware function that checks whether a session exists
+// and apply it to all endpoints that require authentication.
+function requireLogin(req, res, next) {
+  // check if there is user data inside the user
+  if (req.session && req.session.user) {
+    // logged in, call next()
+    next();
+  } else {
+    // if missing
+    res.sendStatus(401);
+  }
+}
+
+// Implement the GET `/logout` endpoint
+app.get("/logout", function (req, res) {
+  // destroy session
+  req.session.destroy(function (err) {
+    if (err) {
+      console.error("Logout error:", err);
+      res.sendStatus(500); // faild 500
+    } else {
+      res.sendStatus(200); // success
+    }
+  });
+});
 
 app.get("/session", function (req, res) {
   if (req.session.user) {
@@ -52,7 +79,7 @@ app.get("/session", function (req, res) {
   }
 });
 
-app.get("/movies", function (req, res) {
+app.get("/movies", requireLogin, function (req, res) {
   const username = req.session.user.username;
   let movies = Object.values(movieModel.getUserMovies(username));
   const queriedGenre = req.query.genre;
@@ -63,7 +90,7 @@ app.get("/movies", function (req, res) {
 });
 
 // Configure a 'get' endpoint for a specific movie
-app.get("/movies/:imdbID", function (req, res) {
+app.get("/movies/:imdbID", requireLogin, function (req, res) {
   const username = req.session.user.username;
   const id = req.params.imdbID;
   const movie = movieModel.getUserMovie(username, id);
@@ -76,15 +103,58 @@ app.get("/movies/:imdbID", function (req, res) {
 });
 
 // Configure a 'put' endpoint for a specific movie to update or insert a movie
-app.put("/movies/:imdbID", function (req, res) {
+app.put("/movies/:imdbID", requireLogin, function (req, res) {
   const username = req.session.user.username;
   const imdbID = req.params.imdbID;
   const exists = movieModel.getUserMovie(username, imdbID) !== undefined;
 
   if (!exists) {
-    // Task 2.3: Fetch the movie data from OmdbAPI, follow the pattern used further down 
-    // in the GET /search endpoint. Implement conversion of the OmdbAPI response to the 
+    // Task 2.3: Fetch the movie data from OmdbAPI, follow the pattern used further down
+    // in the GET /search endpoint. Implement conversion of the OmdbAPI response to the
     // movie format used in the frontend. Make sure to handle errors and timeouts properly.
+    // 构造 OMDb API 详情查询 URL (使用 i= 参数获取详细信息)
+    const url = `http://www.omdbapi.com/?i=${imdbID}&apikey=${config.omdbApiKey}`;
+
+    // 设置超时控制
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      config.omdbTimeoutMs,
+    );
+
+    fetch(url, { signal: controller.signal })
+      .then((apiRes) => {
+        clearTimeout(timeoutId);
+        if (!apiRes.ok) return res.sendStatus(apiRes.status);
+
+        return apiRes.json();
+      })
+      .then((movieData) => {
+        if (movieData.Response === "True") {
+          // 将 OMDb 的属性格式转换为前端/模型使用的格式
+          const internalMovie = {
+            imdbID: movieData.imdbID,
+            Title: movieData.Title,
+            Year: isNaN(movieData.Year) ? null : parseInt(movieData.Year),
+            Genres: movieData.Genre.split(", "), // OMDb 返回逗号分隔字符串
+            Director: movieData.Director,
+            Plot: movieData.Plot,
+            Poster: movieData.Poster,
+          };
+
+          // 保存到当前用户的收藏中
+          movieModel.setUserMovie(username, imdbID, internalMovie);
+          res.status(201).send(internalMovie);
+        } else {
+          res.status(404).send("Movie not found in OMDb");
+        }
+      })
+      .catch((err) => {
+        clearTimeout(timeoutId);
+        if (err.name === "AbortError") return res.sendStatus(504);
+        console.error("OMDb API error during PUT:", err);
+        res.sendStatus(500);
+      });
   } else {
     movieModel.setUserMovie(username, imdbID, req.body);
     res.sendStatus(200);
@@ -102,7 +172,7 @@ app.delete("/movies/:imdbID", function (req, res) {
 });
 
 // Configure a 'get' endpoint for genres of all movies of the current user
-app.get("/genres", function (req, res) {
+app.get("/genres", requireLogin, function (req, res) {
   const username = req.session.user.username;
   const genres = movieModel.getGenres(username);
   genres.sort();
@@ -112,7 +182,7 @@ app.get("/genres", function (req, res) {
 /* Task 2.1. Add the GET /search endpoint: Query omdbapi.com and return
    a list of the results you obtain. Only include the properties 
    mentioned in the README when sending back the results to the client. */
-app.get("/search", function (req, res) {
+app.get("/search", requireLogin, function (req, res) {
   const username = req.session.user.username;
   const query = req.query.query;
   if (!query) {
@@ -125,28 +195,28 @@ app.get("/search", function (req, res) {
   const timeoutId = setTimeout(() => controller.abort(), config.omdbTimeoutMs);
 
   fetch(url, { signal: controller.signal })
-    .then(apiRes => {
+    .then((apiRes) => {
       clearTimeout(timeoutId);
       if (!apiRes.ok) {
         return res.sendStatus(apiRes.status);
       }
-      return apiRes.text().then(data => {
+      return apiRes.text().then((data) => {
         let response;
         try {
           response = JSON.parse(data);
         } catch (parseError) {
-          console.error('Failed to parse OMDb response:', parseError);
+          console.error("Failed to parse OMDb response:", parseError);
           return res.sendStatus(500);
         }
 
-        if (response.Response === 'True') {
-          const results = response.Search
-            .filter(movie => !movieModel.hasUserMovie(username, movie.imdbID))
-            .map(movie => ({
-              Title: movie.Title,
-              imdbID: movie.imdbID,
-              Year: isNaN(movie.Year) ? null : parseInt(movie.Year)
-            }));
+        if (response.Response === "True") {
+          const results = response.Search.filter(
+            (movie) => !movieModel.hasUserMovie(username, movie.imdbID),
+          ).map((movie) => ({
+            Title: movie.Title,
+            imdbID: movie.imdbID,
+            Year: isNaN(movie.Year) ? null : parseInt(movie.Year),
+          }));
           res.send(results);
         } else {
           res.send([]);
@@ -155,11 +225,11 @@ app.get("/search", function (req, res) {
     })
     .catch((err) => {
       clearTimeout(timeoutId);
-      if (err.name === 'AbortError') {
-        console.error('OMDb API request timeout');
+      if (err.name === "AbortError") {
+        console.error("OMDb API request timeout");
         return res.sendStatus(504);
       }
-      console.error('OMDb API error:', err);
+      console.error("OMDb API error:", err);
       res.sendStatus(500);
     });
 });
@@ -167,3 +237,4 @@ app.get("/search", function (req, res) {
 app.listen(config.port);
 
 console.log(`Server now listening on http://localhost:${config.port}/`);
+console.log("DEBUG: API Key is:", config.omdbApiKey);
